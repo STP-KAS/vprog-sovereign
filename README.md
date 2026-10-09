@@ -6,7 +6,7 @@ On 9 October 2026 Maksim Biriukov published [vprogs: a based rollup on Kaspa](ht
 
 ## What runs
 
-`Village` is one covenant. People deposit KAS. Hunt, market, mint, swap, vault, chat, circle, aid, royalty, and a queue are functions in that one state. An exit is a pending leaf until `settle`, and `claim` pays it only after that. `pay_across` between two covenants returns `Foreign`.
+`Village` is one covenant. People deposit KAS. Hunt, market, wage, mint, loyalty, swap, vault, chat, meter, circle, aid, royalty, a queue, and a Layer-Kaspa offer are functions in that one state. `card` names the operator and prints the stall next to the price: a committed exit cannot be withheld, an uncommitted balance waits if every operator stops, and there is no forced-inclusion path and no escape hatch. An exit is a pending leaf until `settle`, and `claim` pays it only after that. `pay_across` between two covenants returns `Foreign`. The archival peer is unnamed. The image pin is a lab digest, not a guest image id.
 
 POC and KUSDT in this crate are program balances. They are not KAS and they are not KCC-20.
 

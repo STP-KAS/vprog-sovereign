@@ -7,4 +7,4 @@ mod merkle;
 mod village;
 
 pub use merkle::{verify, Proof, ACCOUNTS, DEPTH};
-pub use village::{Exit, Refuse, Token, VaultView, Village, ORGANISER};
+pub use village::{Card, Exit, Refuse, Token, VaultView, Village, ORGANISER, STALL};

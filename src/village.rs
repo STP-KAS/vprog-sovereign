@@ -1,10 +1,15 @@
 //! LUMBRIDGE as one program. Desks are functions in this state, not separate apps.
 //! Account 0 is unused. Account 1 is the organiser and cannot take a pot the rules hold.
+//! The operator does not admit an action. The account calls the rule.
+//! The card names who runs the covenant and the stall if every operator stops.
 
 use crate::merkle::{self, leaf, root, Digest32, Proof, ACCOUNTS};
 
 pub const ORGANISER: u8 = 1;
 const PEOPLE: usize = 32;
+
+/// Printed next to a sealed price. The workshop machine has no forced-inclusion path.
+pub const STALL: &str = "A committed exit cannot be withheld. An uncommitted balance waits if every operator stops. There is no forced-inclusion path and no escape hatch.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refuse {
@@ -100,6 +105,36 @@ struct Royalty {
     sealed: bool,
 }
 
+/// Points inside one merchant. A second merchant is a second program.
+#[derive(Clone, Debug)]
+struct Loyalty {
+    merchant: u8,
+    cap: u64,
+    supply: u64,
+    bal: [u64; PEOPLE],
+}
+
+/// The offer is a price. The page body stays outside this program.
+#[derive(Clone, Debug)]
+struct Layer {
+    seller: u8,
+    price: u64,
+}
+
+/// Who runs this covenant, the sealed prices, and what waits if they stop.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Card {
+    pub operator: u8,
+    pub covenant: u64,
+    pub chat_price: u64,
+    pub meter_price: u64,
+    pub stall: &'static str,
+    /// This desk did not read a named archival peer. The field stays empty.
+    pub archival_peer: Option<&'static str>,
+    /// A lab pin. Not a guest image id read from a covenant.
+    pub image_id: Option<Digest32>,
+}
+
 /// One covenant, one lane, one tree. KAS is the deposit rail. POC and KUSDT are program balances.
 #[derive(Clone, Debug)]
 pub struct Village {
@@ -114,6 +149,9 @@ pub struct Village {
     committed: Option<Digest32>,
     chat_price: u64,
     chat_sealed: bool,
+    meter_price: u64,
+    meter_sealed: bool,
+    burned: u128,
     hunt: Option<Hunt>,
     deal: Deal,
     poc: Token,
@@ -123,6 +161,9 @@ pub struct Village {
     aid: Aid,
     royalty: Royalty,
     queue: Vec<u8>,
+    loyalty: Option<Loyalty>,
+    layer: Option<Layer>,
+    image_id: Option<Digest32>,
 }
 
 impl Village {
@@ -139,6 +180,9 @@ impl Village {
             committed: None,
             chat_price,
             chat_sealed: true,
+            meter_price: 0,
+            meter_sealed: false,
+            burned: 0,
             hunt: None,
             deal: Deal::default(),
             poc: Token::new("POC", 0),
@@ -148,7 +192,36 @@ impl Village {
             aid: Aid::default(),
             royalty: Royalty { shares: Vec::new(), sealed: false },
             queue: Vec::new(),
+            loyalty: None,
+            layer: None,
+            image_id: None,
         }
+    }
+
+    /// The operator, the prices, and the stall. The archival peer is unnamed.
+    pub fn card(&self) -> Card {
+        Card {
+            operator: ORGANISER,
+            covenant: self.covenant,
+            chat_price: self.chat_price,
+            meter_price: self.meter_price,
+            stall: STALL,
+            archival_peer: None,
+            image_id: self.image_id,
+        }
+    }
+
+    /// Pins a digest of this lab's label. A second pin fails. This is not a guest image id.
+    pub fn pin_lab_image(&mut self) -> Result<Digest32, Refuse> {
+        if self.image_id.is_some() {
+            return Err(Refuse::Closed);
+        }
+        let id = merkle::hash_parts(&[b"vprog-sovereign lab pin. not a guest image id"]);
+        if id == [0; 32] {
+            return Err(Refuse::Range);
+        }
+        self.image_id = Some(id);
+        Ok(id)
     }
 
     pub fn covenant(&self) -> u64 {
@@ -233,11 +306,18 @@ impl Village {
     pub fn digest(&self) -> Digest32 {
         let leaves = self.leaves();
         let balances = root(&leaves);
+        let image = self.image_id.unwrap_or([0; 32]);
+        let loyalty = self.loyalty.as_ref().map(|book| book.supply).unwrap_or(0);
+        let layer = self.layer.as_ref().map(|offer| offer.price).unwrap_or(0);
         let program = merkle::hash_parts(&[
             &self.daa.to_le_bytes(),
             &self.chat_price.to_le_bytes(),
+            &self.meter_price.to_le_bytes(),
             &self.poc.supply.to_le_bytes(),
             &self.kusdt.supply.to_le_bytes(),
+            &loyalty.to_le_bytes(),
+            &layer.to_le_bytes(),
+            &image,
             &self.exit_bytes(),
         ]);
         merkle::node(balances, program)
@@ -362,6 +442,24 @@ impl Village {
         }
     }
 
+    /// A wage is the same two-signature lock. The rate is the locked amount.
+    pub fn lock_wage(&mut self, payer: u8, worker: u8, rate: u64) -> Result<(), Refuse> {
+        self.lock_deal(payer, worker, rate)
+    }
+
+    pub fn sign_wage(&mut self, who: u8) -> Result<(), Refuse> {
+        self.sign_deal(who)
+    }
+
+    /// The rate cannot move after the lock.
+    pub fn reprice_wage(&mut self, who: u8, _rate: u64) -> Result<(), Refuse> {
+        self.person(who)?;
+        if self.deal.holding == 0 {
+            return Err(Refuse::Closed);
+        }
+        Err(Refuse::Price)
+    }
+
     /// Cap 0 means the mint stays open. A cap above 0 is the most that can be minted.
     pub fn mint_poc(&mut self, who: u8, amount: u64) -> Result<(), Refuse> {
         self.mint_into(&mut self.poc.clone(), who, amount).map(|next| self.poc = next)
@@ -472,6 +570,42 @@ impl Village {
         } else {
             Ok(())
         }
+    }
+
+    /// Seals the price of one tool call. The tool itself stays off the lane.
+    pub fn seal_meter(&mut self, price: u64) -> Result<(), Refuse> {
+        if self.meter_sealed {
+            return Err(Refuse::Price);
+        }
+        if price == 0 {
+            return Err(Refuse::Price);
+        }
+        self.meter_price = price;
+        self.meter_sealed = true;
+        Ok(())
+    }
+
+    /// Burns the sealed price. The operator's balance does not move.
+    pub fn call_meter(&mut self, who: u8) -> Result<(), Refuse> {
+        self.person(who)?;
+        if !self.meter_sealed {
+            return Err(Refuse::Price);
+        }
+        let price = self.meter_price;
+        self.take_kas(who, price)?;
+        match self.burned.checked_add(u128::from(price)) {
+            Some(next) => self.burned = next,
+            None => {
+                self.kas[who as usize] = self.kas[who as usize].saturating_add(price);
+                return Err(Refuse::Range);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn reprice_meter(&mut self, who: u8, _price: u64) -> Result<(), Refuse> {
+        self.person(who)?;
+        Err(Refuse::Price)
     }
 
     pub fn open_circle(&mut self, members: [u8; 4], each: u64) -> Result<(), Refuse> {
@@ -600,13 +734,77 @@ impl Village {
         }
     }
 
+    /// One merchant, one cap. A coalition of merchants is a second program.
+    pub fn open_loyalty(&mut self, merchant: u8, cap: u64) -> Result<(), Refuse> {
+        self.person(merchant)?;
+        if self.loyalty.is_some() {
+            return Err(Refuse::Closed);
+        }
+        if cap == 0 {
+            return Err(Refuse::Cap);
+        }
+        self.loyalty = Some(Loyalty { merchant, cap, supply: 0, bal: [0; PEOPLE] });
+        Ok(())
+    }
+
+    pub fn mint_loyalty(&mut self, merchant: u8, customer: u8, amount: u64) -> Result<(), Refuse> {
+        self.person(customer)?;
+        let book = self.loyalty.as_mut().ok_or(Refuse::Closed)?;
+        if merchant != book.merchant {
+            return Err(Refuse::Organiser);
+        }
+        if amount == 0 || book.supply.saturating_add(amount) > book.cap {
+            return Err(Refuse::Cap);
+        }
+        book.supply = book.supply.checked_add(amount).ok_or(Refuse::Range)?;
+        let slot = &mut book.bal[customer as usize];
+        *slot = slot.checked_add(amount).ok_or(Refuse::Range)?;
+        Ok(())
+    }
+
+    pub fn loyalty(&self, who: u8) -> Result<u64, Refuse> {
+        self.person(who)?;
+        Ok(self.loyalty.as_ref().map(|book| book.bal[who as usize]).unwrap_or(0))
+    }
+
+    /// Lists a price. This does not store a page and does not register a name.
+    pub fn list_layer(&mut self, seller: u8, price: u64) -> Result<(), Refuse> {
+        self.person(seller)?;
+        if self.layer.is_some() {
+            return Err(Refuse::Closed);
+        }
+        if price == 0 {
+            return Err(Refuse::Price);
+        }
+        self.layer = Some(Layer { seller, price });
+        Ok(())
+    }
+
+    pub fn layer_price(&self) -> Option<u64> {
+        self.layer.as_ref().map(|offer| offer.price)
+    }
+
+    /// Pays the listed price inside this covenant.
+    pub fn buy_layer(&mut self, buyer: u8) -> Result<u64, Refuse> {
+        self.person(buyer)?;
+        let layer = self.layer.as_ref().ok_or(Refuse::Closed)?;
+        let price = layer.price;
+        let seller = layer.seller;
+        self.take_kas(buyer, price)?;
+        self.kas[seller as usize] = self.kas[seller as usize].saturating_add(price);
+        self.layer = None;
+        Ok(price)
+    }
+
     pub fn conserved(&self) -> bool {
         let kas: u128 = self.kas.iter().map(|v| u128::from(*v)).sum();
         let locked: u128 = self.locked.iter().map(|v| u128::from(*v)).sum();
         let pending: u128 = self.pending.iter().map(|e| u128::from(e.amount)).sum();
         let committed: u128 = self.committed_exits.iter().map(|e| u128::from(e.amount)).sum();
         // Deal, hunt, circle, and vault bonds sit in `locked`. Aid sits in its own pot.
-        kas + locked + pending + committed + u128::from(self.aid.pot) + self.claimed == self.deposits
+        // A meter burn leaves the operator unpaid and stays in `burned`.
+        kas + locked + pending + committed + u128::from(self.aid.pot) + self.claimed + self.burned
+            == self.deposits
     }
 
     fn pay_hunt(&mut self, winner: Option<u8>) -> Result<Option<u8>, Refuse> {
@@ -871,5 +1069,94 @@ mod tests {
         let (again, proof) = town.prove_kas(3).unwrap();
         assert_eq!(again, amount);
         assert!(merkle::verify(town.balance_root(), 3, leaf, &proof));
+    }
+
+    #[test]
+    fn the_card_names_the_operator_the_stall_and_an_unnamed_peer() {
+        let mut town = funded();
+        let card = town.card();
+        assert_eq!(card.operator, ORGANISER);
+        assert_eq!(card.covenant, 7);
+        assert_eq!(card.stall, STALL);
+        assert!(card.stall.contains("forced-inclusion"));
+        assert!(card.stall.contains("escape hatch"));
+        assert_eq!(card.chat_price, 1);
+        assert_eq!(card.meter_price, 0);
+        assert_eq!(card.archival_peer, None);
+        assert_eq!(card.image_id, None);
+        let before = town.digest();
+        let pin = town.pin_lab_image().unwrap();
+        assert_ne!(pin, [0; 32]);
+        assert_eq!(town.pin_lab_image(), Err(Refuse::Closed));
+        assert_eq!(town.card().image_id, Some(pin));
+        assert_ne!(town.digest(), before);
+        assert!(town.conserved());
+    }
+
+    #[test]
+    fn the_meter_burns_a_sealed_price_and_the_operator_does_not_collect_it() {
+        let mut town = funded();
+        assert_eq!(town.call_meter(3), Err(Refuse::Price));
+        assert_eq!(town.seal_meter(0), Err(Refuse::Price));
+        town.seal_meter(4).unwrap();
+        assert_eq!(town.card().meter_price, 4);
+        assert_eq!(town.seal_meter(5), Err(Refuse::Price));
+        assert_eq!(town.reprice_meter(1, 9), Err(Refuse::Price));
+        let organiser = town.kas(ORGANISER).unwrap();
+        town.call_meter(3).unwrap();
+        assert_eq!(town.kas(3).unwrap(), 46);
+        assert_eq!(town.kas(ORGANISER).unwrap(), organiser);
+        assert!(town.conserved());
+    }
+
+    #[test]
+    fn a_wage_rate_cannot_move_after_the_lock() {
+        let mut town = funded();
+        town.lock_wage(3, 4, 12).unwrap();
+        assert_eq!(town.reprice_wage(3, 13), Err(Refuse::Price));
+        town.sign_wage(3).unwrap();
+        assert_eq!(town.kas(4).unwrap(), 50);
+        town.sign_wage(4).unwrap();
+        assert_eq!(town.kas(3).unwrap(), 38);
+        assert_eq!(town.kas(4).unwrap(), 62);
+        assert_eq!(town.reprice_wage(3, 1), Err(Refuse::Closed));
+        assert!(town.conserved());
+    }
+
+    #[test]
+    fn loyalty_stays_inside_one_merchant_and_under_the_cap() {
+        let mut town = funded();
+        assert_eq!(town.open_loyalty(3, 0), Err(Refuse::Cap));
+        town.open_loyalty(3, 10).unwrap();
+        assert_eq!(town.open_loyalty(4, 10), Err(Refuse::Closed));
+        let (amount, proof) = town.prove_kas(2).unwrap();
+        let root = town.balance_root();
+        let digest = town.digest();
+        let before = town.kas(2).unwrap();
+        town.mint_loyalty(3, 2, 10).unwrap();
+        assert_eq!(town.loyalty(2).unwrap(), 10);
+        assert_eq!(town.mint_loyalty(3, 2, 1), Err(Refuse::Cap));
+        assert_eq!(town.mint_loyalty(4, 2, 1), Err(Refuse::Organiser));
+        assert_eq!(town.kas(2).unwrap(), before);
+        assert_eq!(town.balance_root(), root);
+        assert!(merkle::verify(root, 2, merkle::leaf(amount, 0), &proof));
+        assert_ne!(town.digest(), digest);
+        assert!(town.conserved());
+    }
+
+    #[test]
+    fn a_layer_offer_pays_the_price_and_stores_no_page() {
+        let mut town = funded();
+        assert_eq!(town.list_layer(4, 0), Err(Refuse::Price));
+        town.list_layer(4, 6).unwrap();
+        assert_eq!(town.layer_price(), Some(6));
+        assert_eq!(town.list_layer(5, 1), Err(Refuse::Closed));
+        assert_eq!(town.buy_layer(3).unwrap(), 6);
+        assert_eq!(town.layer_price(), None);
+        assert_eq!(town.kas(3).unwrap(), 44);
+        assert_eq!(town.kas(4).unwrap(), 56);
+        assert_eq!(town.kas(ORGANISER).unwrap(), 0);
+        assert_eq!(town.buy_layer(3), Err(Refuse::Closed));
+        assert!(town.conserved());
     }
 }
