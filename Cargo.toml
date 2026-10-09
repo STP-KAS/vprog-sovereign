@@ -1,0 +1,10 @@
+[package]
+name = "vprog-sovereign"
+version = "0.1.0"
+edition = "2021"
+description = "Lab sovereign apps on the vprogs shape. Not a proof and not a node."
+license = "MIT"
+publish = false
+
+[dependencies]
+sha2 = "0.10"
